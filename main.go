@@ -14,7 +14,7 @@ import (
 	"sync"
 )
 
-var CONCURRENCY = runtime.NumCPU()
+var CONCURRENCY = runtime.NumCPU() / 2
 
 type ConcurrentHashMap struct {
 	sync.Mutex
@@ -47,8 +47,7 @@ func main() {
 		return
 	}
 
-	files := getFiles(args)
-	hashes := hashFiles(files)
+	hashes := getFiles(args)
 	duplicates := checkDupes(hashes)
 
 	for dupe := range duplicates {
@@ -61,7 +60,7 @@ func main() {
 
 func getFiles(dirs []string) <-chan string {
 	var wg sync.WaitGroup
-	files := make(chan string)
+	hashes := make(chan string, 1000)
 	for _, dir := range dirs {
 		wg.Add(1)
 		go func(dir string) {
@@ -74,7 +73,11 @@ func getFiles(dirs []string) <-chan string {
 				if d.IsDir() {
 					return nil
 				}
-				files <- path
+				fileHash, err := getFileHash(path)
+				if err != nil {
+					fmt.Printf("Error getting hash for file:", path, err)
+				}
+				hashes <- fileHash + ":" + path
 				return nil
 			})
 			if err != nil {
@@ -85,29 +88,6 @@ func getFiles(dirs []string) <-chan string {
 	}
 	go func() {
 		wg.Wait()
-		close(files)
-	}()
-	return files
-}
-
-func hashFiles(files <-chan string) <-chan string {
-	var wg sync.WaitGroup
-	hashes := make(chan string)
-	for i := 0; i < CONCURRENCY; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for file := range files {
-				fileHash, err := getFileHash(file)
-				if err != nil {
-					fmt.Printf("Error getting hash for file:", file, err)
-				}
-				hashes <- fileHash + ":" + file
-			}
-		}()
-	}
-	go func() {
-		wg.Wait()
 		close(hashes)
 	}()
 	return hashes
@@ -115,7 +95,7 @@ func hashFiles(files <-chan string) <-chan string {
 
 func checkDupes(fileHashes <-chan string) <-chan string {
 	var wg sync.WaitGroup
-	duplicates := make(chan string)
+	duplicates := make(chan string, 10)
 	fileHashToPath := ConcurrentHashMap{hashmap: make(map[string]string)}
 	for i := 0; i < CONCURRENCY; i++ {
 		wg.Add(1)
@@ -150,7 +130,6 @@ func getFileHash(path string) (string, error) {
 		return "", err
 	}
 	hash := md5.Sum(data)
-	//fmt.Printf("%x: %s\n", hash, path)
 	return fmt.Sprintf("%x", hash), nil
 }
 

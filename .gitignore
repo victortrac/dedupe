@@ -1,0 +1,7 @@
+.idea
+
+# testing dirs
+dir1
+dir2
+dedupe
+memprofile.out
