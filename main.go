@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/md5"
 	"fmt"
+	"github.com/dolthub/swiss"
 	"io"
 	"io/fs"
 	"os"
@@ -18,22 +19,23 @@ var CONCURRENCY = runtime.NumCPU() / 2
 
 type ConcurrentHashMap struct {
 	sync.Mutex
-	hashmap map[string]string
+	hashmap *swiss.Map[string, string]
 }
 
 func (h *ConcurrentHashMap) Set(hash string, path string) {
 	h.Lock()
 	defer h.Unlock()
-	h.hashmap[hash] = path
+	h.hashmap.Put(hash, path)
 }
 
 func (h *ConcurrentHashMap) Get(hash string) (string, error) {
 	h.Lock()
 	defer h.Unlock()
-	if path, exists := h.hashmap[hash]; exists {
+	if h.hashmap.Has(hash) {
+		path, _ := h.hashmap.Get(hash)
 		return path, nil
 	} else {
-		return "", fmt.Errorf("%s not found", path)
+		return "", fmt.Errorf("%s not found", hash)
 	}
 }
 
@@ -96,7 +98,7 @@ func getFiles(dirs []string) <-chan string {
 func checkDupes(fileHashes <-chan string) <-chan string {
 	var wg sync.WaitGroup
 	duplicates := make(chan string, 10)
-	fileHashToPath := ConcurrentHashMap{hashmap: make(map[string]string)}
+	fileHashToPath := ConcurrentHashMap{hashmap: swiss.NewMap[string, string](0)}
 	for i := 0; i < CONCURRENCY; i++ {
 		wg.Add(1)
 		go func() {
