@@ -24,10 +24,9 @@ I then use a little bash script to delete the files:
 ```shell
 > cat delete.sh
 #!/bin/bash
-while read line; do
-  file_to_delete=$(echo "$line" | cut -d ',' -f1)
+while IFS=',' read -r file_to_delete _; do
   echo "Deleting $file_to_delete"
-  rm "$file_to_delete"
+  rm -- "$file_to_delete"
 done < duplicates.log
 ```
 

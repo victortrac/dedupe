@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
-	"crypto/md5"
+	"bytes"
 	"fmt"
-	"github.com/dolthub/swiss"
 	"io"
 	"io/fs"
 	"os"
@@ -13,12 +11,16 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"hash/fnv"
+
+	"github.com/dolthub/swiss"
 )
 
 var CONCURRENCY = runtime.NumCPU() / 2
 
 type ConcurrentHashMap struct {
-	sync.Mutex
+	sync.RWMutex
 	hashmap *swiss.Map[string, string]
 }
 
@@ -28,15 +30,10 @@ func (h *ConcurrentHashMap) Set(hash string, path string) {
 	h.hashmap.Put(hash, path)
 }
 
-func (h *ConcurrentHashMap) Get(hash string) (string, error) {
-	h.Lock()
-	defer h.Unlock()
-	if h.hashmap.Has(hash) {
-		path, _ := h.hashmap.Get(hash)
-		return path, nil
-	} else {
-		return "", fmt.Errorf("%s not found", hash)
-	}
+func (h *ConcurrentHashMap) Get(hash string) (string, bool) {
+	h.RLock()
+	defer h.RUnlock()
+	return h.hashmap.Get(hash)
 }
 
 func main() {
@@ -49,14 +46,31 @@ func main() {
 		return
 	}
 
-	hashes := getFiles(args)
+	hashes := getFiles(args[1:])
 	duplicates := checkDupes(hashes)
 
-	for dupe := range duplicates {
-		// sort & format the output
-		dupes := strings.Split(dupe, ",")
-		sort.Sort(sort.StringSlice(dupes))
-		fmt.Printf("%s\n", strings.Join(dupes, ", "))
+	var wg sync.WaitGroup
+	results := make(chan string, 1000)
+
+	for i := 0; i < CONCURRENCY; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for dupe := range duplicates {
+				dupes := strings.Split(dupe, ",")
+				sort.Strings(dupes)
+				results <- strings.Join(dupes, ", ")
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		fmt.Println(result)
 	}
 }
 
@@ -77,14 +91,14 @@ func getFiles(dirs []string) <-chan string {
 				}
 				fileHash, err := getFileHash(path)
 				if err != nil {
-					fmt.Printf("Error getting hash for file:", path, err)
+					fmt.Printf("Error getting hash for file %s: %v\n", path, err)
+					return nil
 				}
 				hashes <- fileHash + ":" + path
 				return nil
 			})
 			if err != nil {
 				fmt.Printf("error walking the path %q: %v\n", dir, err)
-				return
 			}
 		}(dir)
 	}
@@ -97,19 +111,23 @@ func getFiles(dirs []string) <-chan string {
 
 func checkDupes(fileHashes <-chan string) <-chan string {
 	var wg sync.WaitGroup
-	duplicates := make(chan string, 10)
-	fileHashToPath := ConcurrentHashMap{hashmap: swiss.NewMap[string, string](0)}
+	duplicates := make(chan string, 1000)
+	fileHashToPath := &ConcurrentHashMap{hashmap: swiss.NewMap[string, string](0)}
 	for i := 0; i < CONCURRENCY; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for hashString := range fileHashes {
-				hashParts := strings.Split(hashString, ":")
+				hashParts := strings.SplitN(hashString, ":", 2)
+				if len(hashParts) != 2 {
+					fmt.Printf("Invalid hash string: %s\n", hashString)
+					continue
+				}
 				hash := hashParts[0]
 				path := hashParts[1]
-				if foundPath, err := fileHashToPath.Get(hash); err == nil {
+				if foundPath, exists := fileHashToPath.Get(hash); exists {
 					// file has a duplicate hash; verify if same
-					if isEqual, err := areFilesEqual(path, foundPath); isEqual && err == nil {
+					if isEqual, err := areFilesEqual(path, foundPath); err == nil && isEqual {
 						duplicates <- foundPath + "," + path
 					}
 				} else {
@@ -127,16 +145,35 @@ func checkDupes(fileHashes <-chan string) <-chan string {
 }
 
 func getFileHash(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	hash := md5.Sum(data)
-	return fmt.Sprintf("%x", hash), nil
+	defer file.Close()
+
+	hash := fnv.New64a()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
 // areFilesEqual checks if two files have identical contents
 func areFilesEqual(path1, path2 string) (bool, error) {
+	// First, compare file sizes
+	info1, err := os.Stat(path1)
+	if err != nil {
+		return false, err
+	}
+	info2, err := os.Stat(path2)
+	if err != nil {
+		return false, err
+	}
+	if info1.Size() != info2.Size() {
+		return false, nil
+	}
+
+	// If sizes are equal, compare contents
 	file1, err := os.Open(path1)
 	if err != nil {
 		return false, err
@@ -150,24 +187,27 @@ func areFilesEqual(path1, path2 string) (bool, error) {
 	defer file2.Close()
 
 	// Compare the contents of the two files byte-by-byte using buffered I/O
-	reader1 := bufio.NewReader(file1)
-	reader2 := bufio.NewReader(file2)
+	const bufferSize = 64 * 1024 // 64KB buffer
+	buf1 := make([]byte, bufferSize)
+	buf2 := make([]byte, bufferSize)
 
 	for {
-		byte1, err1 := reader1.ReadByte()
-		byte2, err2 := reader2.ReadByte()
+		n1, err1 := file1.Read(buf1)
+		n2, err2 := file2.Read(buf2)
 
-		if err1 == nil && err2 == nil {
-			if byte1 != byte2 {
-				return false, nil
-			}
+		if n1 != n2 || !bytes.Equal(buf1[:n1], buf2[:n2]) {
+			return false, nil
 		}
-		if err1 == io.EOF && err2 != io.EOF {
-			return false, nil
-		} else if err2 == io.EOF && err1 != io.EOF {
-			return false, nil
-		} else if err1 == io.EOF && err2 == io.EOF {
+
+		if err1 == io.EOF && err2 == io.EOF {
 			return true, nil
+		}
+
+		if err1 != nil && err1 != io.EOF && err1 != io.ErrUnexpectedEOF {
+			return false, err1
+		}
+		if err2 != nil && err2 != io.EOF && err2 != io.ErrUnexpectedEOF {
+			return false, err2
 		}
 	}
 }
